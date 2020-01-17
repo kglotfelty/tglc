@@ -1,0 +1,13 @@
+infile,f,a,"11072/primary/acisf11072N003_evt2.fits.gz",,,"Input event file"
+phafile,f,a,"11072/primary/acisf11072N003_pha2.fits.gz",,,"Input pha2 file with REGION extension"
+outfile,f,a,"acis_meg",,,"Output file name"
+dtffile,f,h,"",,,"Dead time factors file, HRC only"
+grating,s,h,"meg",default|heg|meg|leg,,"Grating ARM"
+order,i,h,1,1,9,"Grating order, +/- are combined"
+wavlo,r,h,0,0,400,"Minimum wavelength (A)"
+wavhi,r,h,400,0,400,"Maximum wavelength (A)"
+binsize,r,h,500,0,,"Lightcurve bin size (sec)"
+clobber,b,h,yes,,,"Remove outfile if it already exists?"
+verbose,i,h,2,0,5,"Amount of tool chatter"
+tmpdir,f,h,"/tmp",,,"Temporary directory"
+mode,s,h,"ql",,,

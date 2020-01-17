@@ -1,0 +1,251 @@
+#!/usr/bin/env python
+#
+# Copyright (C) 2020 Smithsonian Astrophysical Observatory
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License along
+# with this program; if not, write to the Free Software Foundation, Inc.,
+# 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+#
+
+toolname = "tglc"
+__revision__ = "17 January 2020"
+
+import sys
+import os
+
+
+import ciao_contrib.logger_wrapper as lw
+lw.initialize_logger(toolname)
+lgr = lw.get_logger(toolname)
+verb0 = lgr.verbose0
+verb1 = lgr.verbose1
+verb2 = lgr.verbose2
+verb3 = lgr.verbose3
+verb4 = lgr.verbose4
+verb5 = lgr.verbose5
+
+from ciao_contrib.runtool import make_tool
+
+class CIAONamedTemporaryFile():
+    "CIAO named temp file, uses ASCDS_WORK_PATH and del when done."    
+    _tmpdir = os.environ["ASCDS_WORK_PATH"]
+    
+    def __init__(self, **args):
+        from tempfile import NamedTemporaryFile
+        retval = NamedTemporaryFile( dir=self._tmpdir,delete=False, **args )
+        self.__tmp = retval
+
+
+    @property
+    def name(self):
+        return self.__tmp.name
+
+    
+    def __del__(self):
+        try:
+            self.__tmp.close()
+        except:
+            pass
+        finally:
+            if os.path.exists( self.__tmp.name ):
+                os.unlink( self.__tmp.name)
+
+
+def get_background_area_scaling(srcreg, bkgreg, wavlo, wavhi, bin=0.0001):
+    """
+    Compute the area of the src and background; return backscaling.
+    """
+
+    def get_bounded_area( reg ):
+        from region import CXCRegion, rectangle
+        sr = CXCRegion(reg)
+        wavbox = rectangle( wavlo, sr.extent()["y0"], wavhi, sr.extent()["y1"])
+        area = (sr*wavbox).area(bin=bin)     
+        return(area)
+
+    sa = get_bounded_area(srcreg)
+    verb2("Source area = {}".format(sa))
+    
+    ba = get_bounded_area(bkgreg)
+    verb2("Background area = {}".format(ba))
+
+    retval=sa/ba    
+    verb2("Background area scaling={}".format(retval))
+
+    return retval
+
+
+def make_temp_evt_copy( evtfile, wavlo, wavhi ):
+    """Make a temp copy of the event file.
+    
+    The real reason to do this is that we need to dissolve the 
+    the tg_r,tg_d vector column so that we can use tg_d
+    as part of a different filter.  This is the dmhedit 
+    command.
+    
+    But since we are doing it, we might as well filter on the
+    desired wavelength range.    
+    """
+    assert wavlo < wavhi, "ERROR: min wavelength >= max"
+
+    dmcopy = make_tool("dmcopy")
+    tmpevt = CIAONamedTemporaryFile(suffix="_evt.fits")
+
+    dmcopy.infile="{}[tg_lam={}:{}]".format(evtfile, wavlo, wavhi)
+    dmcopy.outfile=tmpevt.name
+    v = dmcopy(clobber=True)
+    if v:
+        verb2(v)
+    
+    dmhedit=make_tool("dmhedit")
+    v = dmhedit(infile=tmpevt.name, file="", op="add", key="MFORM1",
+            value="tg_r")
+    if v:
+        verb2(v)
+
+    return tmpevt
+
+
+def create_region_filter_expression( pha, part, order, src=True):
+    """
+    Create complex filter expression.  
+    
+    The REGION block attached to the PHA file is filtered as
+    is the event file.
+    """
+
+    # TODO: tgextract2 regions?
+
+    rid="SOURCE" if src is True else "BACKGROUND_UP,BACKGROUND_DOWN"
+
+    grating_order = "tg_part={part},tg_m=-{order}:{order}"
+    grating_order = grating_order.format(part=part,order=order)
+    rows = "rowid={rid},{go}".format(rid=rid,go=grating_order)
+    reg= "{pha}[REGION][{rows}]".format(pha=pha,rows=rows)
+
+    tgfilter="{go},(tg_lam,tg_d)=region({reg})"
+    tgfilter=tgfilter.format(go=grating_order,reg=reg)
+    
+    return tgfilter,reg
+
+
+def get_regions( pha, part, order, wavlo, wavhi):
+    """
+    Get extraction regions from the PHA file
+    """
+    assert wavlo < wavhi, "ERROR: min wavelength >= max"
+    src,srcreg = create_region_filter_expression(pha, part, order, src=True)
+    bkg,bkgreg = create_region_filter_expression(pha, part, order, src=False)
+    bscale = get_background_area_scaling( srcreg, bkgreg, wavlo, wavhi)
+    return (src, bkg, bscale)
+
+
+def run_dmextract( evt, dtf, src, bkg, bscale, binsize, outfile ):
+    """
+    Run dmextract to create light curve
+    """
+    dme = make_tool("dmextract")
+    dme.infile="{e}[{f}][bin time=::{b}]".format(e=evt,f=src,b=binsize)
+    dme.bkg="{e}[{f}]".format(e=evt,f=bkg)
+    dme.outfile=outfile
+    dme.bkgnorm=bscale
+    dme.exp=dtf
+    dme.bkgexp=dtf
+    dme.opt="ltc1"
+    v = dme(clobber=True)
+    if v:
+        verb2(v)
+
+
+def map_grattype(grating):
+    """
+    Map grating grattype to numerical value.
+    """
+    gmap = { 'heg':1, 'meg':2, 'leg':3 }
+    grating=grating.lower()
+    assert grating in gmap, "ERROR: Unknown grating type: "+grating
+    return gmap[grating]
+
+
+def validate_parameters(pars):
+    """
+    Various checks on input parameters
+    """
+    
+    from pycrates import read_file
+    tab = read_file(pars["infile"])
+    
+    grt = tab.get_key_value("GRATING").lower()
+    if grt == "none":
+        raise ValueError("ERROR: This is not a gratings dataset")
+    
+    if "default" == pars["grating"]:
+        pars["grating"] = "leg" if "letg"==grt else "heg"    
+    if "hetg"==grt and "leg"==pars["grating"]:
+        raise RuntimeError("ERROR: Cannot use leg with HETG observation")
+    if "letg"==grt and (pars["grating"] in ["heg","meg"]):
+        raise RuntimeError("ERROR: Cannot use {} with LETG observation".format(pars["grating"]))
+    
+    inst = tab.get_key_value("INSTRUME")
+    if ("HRC" == inst):
+        if ""==pars["dtffile"]:
+            import ciao_contrib._tools.obsinfo as o
+            obs = o.ObsInfo(pars["infile"])
+            pars["dtffile"]=obs.get_ancillary("dtf")
+
+        if pars["dtffile"] is None or "none"==pars["dtffile"].lower():
+            verb0("WARNING: Using HRC without a dtffile is NOT recommend.")
+            pars["dtffile"]=""
+    
+    pars["clobber"]= ("yes"==pars["clobber"]) # T/F
+    pars["wavlo"] = float(pars["wavlo"])
+    pars["wavhi"] = float(pars["wavhi"])
+
+    from ciao_contrib._tools.fileio import outfile_clobber_checks
+    outfile_clobber_checks( pars["clobber"], pars["outfile"] )
+
+
+@lw.handle_ciao_errors( toolname, __revision__)
+def make_tg_lc():
+    """Main routine"""
+
+    import ciao_contrib.param_soaker as ps
+    pars = ps.get_params( toolname, "rw", sys.argv,
+        verbose={"set":lw.set_verbosity, "cmd":verb1} )
+
+    validate_parameters(pars)
+    _part = map_grattype(pars["grating"])
+
+    src,bkg,bscale = get_regions( pars["phafile"], _part, 
+        pars["order"], pars["wavlo"], pars["wavhi"] )
+
+    tmpevt = make_temp_evt_copy( pars["infile"], 
+        pars["wavlo"], pars["wavhi"])
+
+    run_dmextract( tmpevt.name, pars["dtffile"], src, bkg, bscale, 
+        pars["binsize"], pars["outfile"] )
+    
+    from ciao_contrib.runtool import add_tool_history
+    add_tool_history( pars["outfile"], toolname, pars, 
+        toolversion=__revision__)
+
+    
+if __name__ == "__main__":
+    try:
+        make_tg_lc()
+    except Exception as E:
+        print("\n# "+toolname+" ("+__revision__+"): ERROR "+str(E)+"\n", file=sys.stderr)
+        sys.exit(1)
+    sys.exit(0)
+
+
